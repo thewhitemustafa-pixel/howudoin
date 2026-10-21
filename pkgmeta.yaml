@@ -1,0 +1,8 @@
+package-as: howudoin
+
+ignore:
+  - README.md
+  - wiki.md
+  - CHANGELOG.md
+  - .github/
+  - howudoin.jpg
