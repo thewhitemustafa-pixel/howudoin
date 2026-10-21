@@ -5,9 +5,20 @@ local NUM_SOUNDS = 14
 local THROTTLE_SECONDS = 2
 
 -- Forever-only tuning (no combat log, so crits are credited to you by timing):
-local ATTRIBUTION_WINDOW = 1.5   -- seconds after one of YOUR casts that a crit on your target counts as yours
 local FINISHER_CHECK_DELAY = 0.1 -- seconds to wait before checking "did that crit kill / fully heal the target?"
 local DUPLICATE_WINDOW = 0.1     -- UNIT_COMBAT can fire once per unit token for the same hit; ignore repeats
+
+-- Cast-buffer / attribution tuning
+local ATTRIBUTION_WINDOW   = 1.5  -- legacy fallback window (kept for compatibility); not used by the new path
+local MAX_CASTS            = 12   -- buffer size
+local CAST_BUFFER_MAX_AGE  = 15   -- seconds before a cast is pruned
+local DEDUP_MAX_AGE        = 30   -- seconds before a per-castGUID dedup entry is pruned
+local INSTANT_WINDOW       = 0.35 -- tight window after an instant cast
+local INSTANT_LOOSE        = 0.75 -- loose window after an instant cast
+local CAST_EARLY_SLACK     = 0.15 -- how far before the expected completion time a hit can land
+local CAST_LATE_WINDOW     = 0.50 -- minimum window after expected completion (projectile travel)
+local CHANNEL_LATE_WINDOW  = 0.50 -- extra window after a channel ends
+local HIGH_CONFIDENCE      = 3    -- score needed to attribute a crit to a specific cast
 
 -- GetAddOnMetadata moved to C_AddOns in modern clients (and the global is gone on Forever).
 local GetMetadata = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
@@ -21,6 +32,7 @@ local HAS_COMBAT_LOG = CombatLogGetCurrentEventInfo ~= nil and issecretvalue == 
 
 local DEFAULTS = {
   TRIGGER_ON_SWING = true,
+  SWING_SOLO_ONLY  = true,  -- only attribute auto-attack crits to you while solo
   FINISHER_ON_OVERKILL = true,
   THROTTLE_SOUNDS = false,
   BEST_CRIT_ONLY = false, -- only play for crits close to your best crit with that spell
@@ -66,6 +78,12 @@ local function DebugValue(value)
     return '<secret>'
   end
   return tostring(value)
+end
+
+local function ClearTable(tbl)
+  for k in pairs(tbl) do
+    tbl[k] = nil
+  end
 end
 
 -- Sound
@@ -135,7 +153,160 @@ local function CritIsWorthPlaying(key, name, amount)
   return passes or not settings.BEST_CRIT_ONLY
 end
 
--- Backend 1: combat log (Classic Era / TBC / MoP Classic). This is your original logic.
+-- Spell metadata helpers
+
+local function GetSpellName(spellID)
+  if type(spellID) ~= 'number' or IsSecret(spellID) then
+    return nil
+  end
+  if C_Spell and C_Spell.GetSpellName then
+    return SafeCall(C_Spell.GetSpellName, spellID)
+  end
+end
+
+local function GetSpellCastTime(spellID)
+  if type(spellID) ~= 'number' or IsSecret(spellID) then
+    return 0
+  end
+  if not (C_Spell and C_Spell.GetSpellInfo) then
+    return 0
+  end
+  local info = SafeCall(C_Spell.GetSpellInfo, spellID)
+  if not info then
+    return 0
+  end
+  local castTime = info.castTime
+  if IsSecret(castTime) or type(castTime) ~= 'number' then
+    return 0
+  end
+  return castTime / 1000
+end
+
+-- Cast buffer + attribution scoring (Forever path)
+
+local castBuffer = {}          -- newest-first array of cast records
+local lastCritByCastGUID = {}  -- [castGUID] = last crit time, for per-cast dedup
+local lastSwingCritTime = 0    -- global dedup for the swing fallback
+local inCombat = false
+local nextSyntheticCastID = 0
+
+local function PruneCastBuffer()
+  local now = GetTime()
+  local i = 1
+  while i <= #castBuffer do
+    if now - castBuffer[i].startTime > CAST_BUFFER_MAX_AGE then
+      table.remove(castBuffer, i)
+    else
+      i = i + 1
+    end
+  end
+  for guid, t in pairs(lastCritByCastGUID) do
+    if now - t > DEDUP_MAX_AGE then
+      lastCritByCastGUID[guid] = nil
+    end
+  end
+end
+
+local function PushCast(entry)
+  PruneCastBuffer()
+  if not entry.castGUID then
+    nextSyntheticCastID = nextSyntheticCastID + 1
+    entry.castGUID = 'synth_' .. nextSyntheticCastID
+  end
+  table.insert(castBuffer, 1, entry)
+  if #castBuffer > MAX_CASTS then
+    table.remove(castBuffer)
+  end
+end
+
+local function FindCastByGUID(castGUID)
+  if not castGUID then
+    return nil
+  end
+  for _, cast in ipairs(castBuffer) do
+    if cast.castGUID == castGUID then
+      return cast
+    end
+  end
+end
+
+-- Score a crit against every buffered cast. Returns (bestScore, bestMatch).
+-- score 4 = strong match, 2 = loose match, 1 = weak/borderline, 0 = no match.
+local function ScoreCrit(unit, now)
+  local unitGUID = SafeCall(UnitGUID, unit)
+  local bestScore, bestMatch = 0, nil
+
+  for _, cast in ipairs(castBuffer) do
+    -- Target check: if we know which unit the cast was aimed at, the crit must land on it.
+    if cast.targetGUID and unitGUID and cast.targetGUID ~= unitGUID then
+      goto continue
+    end
+
+    local age = now - cast.startTime
+    local score = 0
+
+    if cast.isChannel then
+      -- Channels/empowers can tick at any point between start and end.
+      if age >= -0.2 and age <= cast.castTime + CHANNEL_LATE_WINDOW then
+        score = 4
+      elseif age >= -0.5 and age <= cast.castTime + 1.0 then
+        score = 2
+      end
+    elseif cast.castTime == 0 then
+      -- Instant casts land almost immediately.
+      if age >= -0.2 and age <= INSTANT_WINDOW then
+        score = 4
+      elseif age >= 0 and age <= INSTANT_LOOSE then
+        score = 2
+      end
+    else
+      -- Cast-time spells land near start + castTime + projectile travel.
+      local expected = cast.castTime
+      local lateWindow = math.max(CAST_LATE_WINDOW, expected * 0.25)
+      if age >= expected - CAST_EARLY_SLACK and age <= expected + lateWindow then
+        score = 4
+      elseif age >= expected and age <= expected + 1.0 then
+        score = 2
+      end
+      -- If the cast hasn't completed yet, it can't have produced a hit (non-channel).
+      if not cast.confirmed and age < cast.castTime then
+        score = 0
+      end
+    end
+
+    if score > bestScore then
+      bestScore = score
+      bestMatch = cast
+    end
+
+    ::continue::
+  end
+
+  return bestScore, bestMatch
+end
+
+local function DumpCastBuffer()
+  if #castBuffer == 0 then
+    printHowudoin('cast buffer: (empty)')
+    return
+  end
+  local now = GetTime()
+  printHowudoin('cast buffer (' .. #castBuffer .. ' entries):')
+  for i, c in ipairs(castBuffer) do
+    print(format('  [%d] spell=%s castGUID=%s tgt=%s age=%.2fs ct=%.2fs ch=%s em=%s cf=%s',
+      i,
+      tostring(c.spellID),
+      tostring(c.castGUID),
+      tostring(c.targetGUID),
+      now - c.startTime,
+      c.castTime,
+      tostring(c.isChannel),
+      tostring(c.isEmpower),
+      tostring(c.confirmed)))
+  end
+end
+
+-- Backend 1: combat log (Classic Era / TBC / MoP Classic). Unchanged from the original.
 
 local function OnCombatLog()
   PLAYER_GUID = PLAYER_GUID or UnitGUID('player')
@@ -181,17 +352,10 @@ local function OnCombatLog()
   PlayCritSound(howudoinCharSettings.FINISHER_ON_OVERKILL and excess ~= nil and excess > 0)
 end
 
--- Backend 2: unit events (WoW: Forever). No combat log, so we watch UNIT_COMBAT, which tells us a
--- unit took damage/healing and whether it was a crit, but NOT who caused it. We credit it to you
--- when it lands on your target shortly after one of your casts (or while you are auto-attacking).
-
-local lastCastTime = 0
-local lastCastSpellID
-local lastTriggerTime = 0
-
-local function CastRecently()
-  return GetTime() - lastCastTime <= ATTRIBUTION_WINDOW
-end
+-- Backend 2: unit events (WoW: Forever). We can't read the combat log, so we correlate UNIT_COMBAT
+-- crits against a buffer of the casts the player has recently made. A crit is credited to the player
+-- only when it lines up with a specific cast on a specific target at a time consistent with that
+-- spell's cast time.
 
 local function IsAutoAttacking()
   local isCurrentSpell = (C_Spell and C_Spell.IsCurrentSpell) or IsCurrentSpell
@@ -207,28 +371,111 @@ local function TargetFinished(unit, isHeal)
   return SafeCall(UnitIsDead, unit) == true
 end
 
-local function OnSpellcastSucceeded(_, _, spellID)
-  lastCastTime = GetTime()
-  lastCastSpellID = spellID
-end
-
--- Record key + display name for a crit credited to your last cast (or to your auto attack).
+-- Record key + display name for a crit credited to a specific cast (or to your auto attack).
 local function SpellKey(kind, spellID)
   if type(spellID) ~= 'number' or IsSecret(spellID) then
     return kind .. ':unknown', kind == 'heal' and 'Heals' or 'Damage spells'
   end
-  local name = C_Spell and C_Spell.GetSpellName and SafeCall(C_Spell.GetSpellName, spellID)
+  local name = GetSpellName(spellID)
   return kind .. ':' .. spellID, name or ('Spell ' .. spellID)
+end
+
+-- UNIT_SPELLCAST_SENT: fires when the player begins casting. Arg 1 is the unit the cast is aimed at
+-- (a token like "target" or "focus"), which we save so the crit has to land on the intended unit.
+local function OnSpellcastSent(unitTarget, castGUID, spellID)
+  local targetGUID = unitTarget and SafeCall(UnitGUID, unitTarget) or nil
+  PushCast({
+    spellID = spellID,
+    castGUID = castGUID,
+    targetGUID = targetGUID,
+    startTime = GetTime(),
+    castTime = GetSpellCastTime(spellID),
+    isChannel = false,
+    isEmpower = false,
+    confirmed = false,
+  })
+  if debugMode then
+    printHowudoin('SENT', spellID, castGUID, 'target=' .. tostring(targetGUID))
+  end
+end
+
+local function OnSpellcastSucceeded(_, castGUID, spellID)
+  local existing = FindCastByGUID(castGUID)
+  if existing then
+    existing.confirmed = true
+    existing.succeededAt = GetTime()
+    if debugMode then
+      printHowudoin('SUCCEEDED', spellID, castGUID, '(confirmed)')
+    end
+    return
+  end
+  -- No SENT record (some procs / instants never fire SENT). Reconstruct using the spell's cast time.
+  local castTime = GetSpellCastTime(spellID)
+  local now = GetTime()
+  PushCast({
+    spellID = spellID,
+    castGUID = castGUID,
+    targetGUID = SafeCall(UnitGUID, 'target'),
+    startTime = now - castTime,
+    castTime = castTime,
+    isChannel = false,
+    isEmpower = false,
+    confirmed = true,
+    succeededAt = now,
+  })
+  if debugMode then
+    printHowudoin('SUCCEEDED', spellID, castGUID, '(fallback, no SENT)')
+  end
+end
+
+local function OnChannelStart(_, castGUID, spellID)
+  local existing = FindCastByGUID(castGUID)
+  if existing then
+    existing.isChannel = true
+  else
+    PushCast({
+      spellID = spellID,
+      castGUID = castGUID,
+      targetGUID = SafeCall(UnitGUID, 'target'),
+      startTime = GetTime(),
+      castTime = GetSpellCastTime(spellID),
+      isChannel = true,
+      isEmpower = false,
+      confirmed = true,
+    })
+  end
+  if debugMode then
+    printHowudoin('CHANNEL_START', spellID, castGUID)
+  end
+end
+
+local function OnEmpowerStart(_, castGUID, spellID)
+  local existing = FindCastByGUID(castGUID)
+  if existing then
+    existing.isEmpower = true
+  else
+    PushCast({
+      spellID = spellID,
+      castGUID = castGUID,
+      targetGUID = SafeCall(UnitGUID, 'target'),
+      startTime = GetTime(),
+      castTime = GetSpellCastTime(spellID),
+      isChannel = false,
+      isEmpower = true,
+      confirmed = true,
+    })
+  end
+  if debugMode then
+    printHowudoin('EMPOWER_START', spellID, castGUID)
+  end
 end
 
 local function OnUnitCombat(unit, action, flagText, amount, schoolMask)
   if debugMode then
     printHowudoin('UNIT_COMBAT', 'unit=' .. DebugValue(unit), 'action=' .. DebugValue(action),
-      'flag=' .. DebugValue(flagText), 'amount=' .. DebugValue(amount), 'school=' .. DebugValue(schoolMask),
-      format('lastCast=%.2fs ago', GetTime() - lastCastTime))
+      'flag=' .. DebugValue(flagText), 'amount=' .. DebugValue(amount), 'school=' .. DebugValue(schoolMask))
   end
 
-  -- Secret values can't be compared; if the game hides these we simply can't detect the crit.
   if IsSecret(unit) or IsSecret(action) or IsSecret(flagText) then
     return
   end
@@ -241,38 +488,65 @@ local function OnUnitCombat(unit, action, flagText, amount, schoolMask)
     return
   end
 
-  local castRecently = CastRecently()
-
   if isHeal then
-    -- Heal crits count on friendly units only, and only right after you cast something.
-    if SafeCall(UnitCanAssist, 'player', unit) == false or not castRecently then
+    if SafeCall(UnitCanAssist, 'player', unit) == false then
       return
     end
   else
-    -- Damage crits count on your target only (one token per hit, so no duplicate sounds).
-    if unit ~= 'target' or SafeCall(UnitCanAttack, 'player', unit) == false then
+    if unit ~= 'target' then
       return
     end
-    if not castRecently then
-      -- No recent cast: only a white (auto-attack) swing could have done it.
-      if not IsAutoAttacking() or not howudoinCharSettings.TRIGGER_ON_SWING then
-        return
-      end
+    if SafeCall(UnitCanAttack, 'player', unit) == false then
+      return
     end
   end
 
   local now = GetTime()
-  if now - lastTriggerTime < DUPLICATE_WINDOW then
+  local score, matchedCast = ScoreCrit(unit, now)
+  local key, name
+
+  if score >= HIGH_CONFIDENCE and matchedCast then
+    -- High-confidence match: this crit lines up with a specific cast.
+    key, name = SpellKey(isHeal and 'heal' or 'dmg', matchedCast.spellID)
+    local lastCrit = lastCritByCastGUID[matchedCast.castGUID] or 0
+    if now - lastCrit < DUPLICATE_WINDOW then
+      if debugMode then
+        printHowudoin('dedup: crit for castGUID ' .. tostring(matchedCast.castGUID) .. ' too soon, skipping')
+      end
+      return
+    end
+    lastCritByCastGUID[matchedCast.castGUID] = now
+    if debugMode then
+      printHowudoin('attributed to cast', matchedCast.spellID, 'score=' .. score)
+    end
+
+  elseif (not isHeal) and IsAutoAttacking() and howudoinCharSettings.TRIGGER_ON_SWING then
+    -- No cast match at all: could be an auto-attack. Gate by group state because in groups another
+    -- melee player could be the source.
+    local inGroup = SafeCall(IsInGroup) == true or SafeCall(IsInRaid) == true
+    if inGroup and howudoinCharSettings.SWING_SOLO_ONLY then
+      if debugMode then
+        printHowudoin('swing: in group, SWING_SOLO_ONLY on -> skipping (score=' .. score .. ')')
+      end
+      return
+    end
+    if now - lastSwingCritTime < DUPLICATE_WINDOW then
+      return
+    end
+    lastSwingCritTime = now
+    key, name = 'swing', 'Auto Attack'
+    if debugMode then
+      printHowudoin('attributed to auto-attack (score=' .. score .. ')')
+    end
+
+  else
+    -- score is 1-2 (weak match, likely another player) or 0 with no valid alternative.
+    if debugMode then
+      printHowudoin('rejected: score=' .. score, 'isHeal=' .. tostring(isHeal))
+    end
     return
   end
-  lastTriggerTime = now
 
-  local key, name
-  if castRecently then
-    key, name = SpellKey(isHeal and 'heal' or 'dmg', lastCastSpellID)
-  else
-    key, name = 'swing', 'Auto Attack'
-  end
   if not CritIsWorthPlaying(key, name, amount) then
     return
   end
@@ -341,6 +615,10 @@ local TOGGLES = {
     key = 'TRIGGER_ON_SWING',
     on = function() return 'Sound triggers on Weapon(White) crits.' end,
   },
+  swingsolo = {
+    key = 'SWING_SOLO_ONLY',
+    on = function() return 'Only attribute auto-attack crits to you while solo (avoids other players in groups).' end,
+  },
   overkill = {
     key = 'FINISHER_ON_OVERKILL',
     on = function() return 'Different howudoin sound for finishing crits (overkill / killing blow).' end,
@@ -373,19 +651,23 @@ SlashCmdList['HOWUDOIN'] = function(input)
     printHowudoin('-- Crit records cleared.')
   elseif command == 'debug' then
     debugMode = not debugMode
-    printHowudoin('-- Debug output (best-crit decisions' .. (HAS_COMBAT_LOG and '' or ', raw UNIT_COMBAT events') .. ').', formatSetting(debugMode))
+    printHowudoin('-- Debug output (best-crit decisions' .. (HAS_COMBAT_LOG and '' or ', UNIT_COMBAT events, cast buffer') .. ').', formatSetting(debugMode))
+  elseif command == 'buffer' then
+    DumpCastBuffer()
   else
     PlayRandomHowudoin()
     printHowudoin('Config')
     print('  Plays a random howudoin when you land a crit!')
     print('  Mode: ' .. (HAS_COMBAT_LOG and 'combat log' or 'unit events (no combat log available)') .. '|n')
     print('/howudoin swing|n-- Toggle - Sound triggers on Weapon(White) crits.', 'Currently', formatSetting(settings.TRIGGER_ON_SWING))
+    print('/howudoin swingsolo|n-- Toggle - Only credit auto-attack crits to you while solo.', 'Currently', formatSetting(settings.SWING_SOLO_ONLY))
     print('/howudoin overkill|n-- Toggle - Different howudoin sound for finishing crits (overkill / killing blow).', 'Currently', formatSetting(settings.FINISHER_ON_OVERKILL))
     print('/howudoin throttle|n-- Toggle - Sets a ' .. THROTTLE_SECONDS .. ' second cooldown on sounds playing (Helps reduce spam for melee classes and for AOE).', 'Currently', formatSetting(settings.THROTTLE_SOUNDS))
     print('/howudoin best|n-- Toggle - Only play for crits close to your best crit with that spell.', 'Currently', formatSetting(settings.BEST_CRIT_ONLY))
     print('/howudoin tolerance <0-100>|n-- How close to your best counts, in percent (0 = new records only).', 'Currently', settings.BEST_TOLERANCE .. '%')
     print('/howudoin records|n-- Show your best crits.')
     print('/howudoin reset|n-- Clear your crit records.')
+    print('/howudoin buffer|n-- Dump the current cast buffer (for troubleshooting).')
     print('/howudoin debug|n-- Toggle - Print what the addon sees, for troubleshooting.', 'Currently', formatSetting(debugMode))
   end
 end
@@ -407,13 +689,30 @@ handlers.ADDON_LOADED = function(name)
   if HAS_COMBAT_LOG then
     frame:RegisterEvent('COMBAT_LOG_EVENT_UNFILTERED')
   else
+    -- Forever: build a small cast timeline and match crits against it.
     frame:RegisterEvent('UNIT_COMBAT')
+    frame:RegisterEvent('UNIT_SPELLCAST_SENT')
     frame:RegisterUnitEvent('UNIT_SPELLCAST_SUCCEEDED', 'player')
+    frame:RegisterUnitEvent('UNIT_SPELLCAST_CHANNEL_START', 'player')
+    frame:RegisterUnitEvent('UNIT_SPELLCAST_EMPOWER_START', 'player')
+    frame:RegisterEvent('PLAYER_REGEN_DISABLED')
+    frame:RegisterEvent('PLAYER_REGEN_ENABLED')
   end
 end
 handlers.COMBAT_LOG_EVENT_UNFILTERED = OnCombatLog
 handlers.UNIT_COMBAT = OnUnitCombat
+handlers.UNIT_SPELLCAST_SENT = OnSpellcastSent
 handlers.UNIT_SPELLCAST_SUCCEEDED = OnSpellcastSucceeded
+handlers.UNIT_SPELLCAST_CHANNEL_START = OnChannelStart
+handlers.UNIT_SPELLCAST_EMPOWER_START = OnEmpowerStart
+handlers.PLAYER_REGEN_DISABLED = function()
+  inCombat = true
+end
+handlers.PLAYER_REGEN_ENABLED = function()
+  inCombat = false
+  ClearTable(castBuffer)
+  ClearTable(lastCritByCastGUID)
+end
 
 frame:RegisterEvent('ADDON_LOADED')
 frame:SetScript('OnEvent', function(_, event, ...)
