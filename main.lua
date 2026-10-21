@@ -19,6 +19,8 @@ local CAST_EARLY_SLACK     = 0.15 -- how far before the expected completion time
 local CAST_LATE_WINDOW     = 0.50 -- minimum window after expected completion (projectile travel)
 local CHANNEL_LATE_WINDOW  = 0.50 -- extra window after a channel ends
 local HIGH_CONFIDENCE      = 3    -- score needed to attribute a crit to a specific cast
+local LOOSE_CONFIDENCE     = 2    -- a loose match is accepted if it is the ONLY cast that could have caused the hit
+local UNCONFIRMED_GRACE    = 2.0  -- seconds past its expected completion before a never-confirmed cast is ignored
 
 -- GetAddOnMetadata moved to C_AddOns in modern clients (and the global is gone on Forever).
 local GetMetadata = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
@@ -78,6 +80,23 @@ local function DebugValue(value)
     return '<secret>'
   end
   return tostring(value)
+end
+
+-- Event arguments can be secret in restricted situations. These return nil instead of a secret.
+local function CleanGUID(value)
+  if type(value) == 'string' and not IsSecret(value) then
+    return value
+  end
+end
+
+local function CleanNumber(value)
+  if type(value) == 'number' and not IsSecret(value) then
+    return value
+  end
+end
+
+local function IsPlayerUnit(unit)
+  return not IsSecret(unit) and unit == 'player'
 end
 
 local function ClearTable(tbl)
@@ -229,11 +248,20 @@ local function FindCastByGUID(castGUID)
   end
 end
 
--- Score a crit against every buffered cast. Returns (bestScore, bestMatch).
--- score 4 = strong match, 2 = loose match, 1 = weak/borderline, 0 = no match.
+local function RemoveCast(cast)
+  for i, c in ipairs(castBuffer) do
+    if c == cast then
+      table.remove(castBuffer, i)
+      return
+    end
+  end
+end
+
+-- Score a crit against every buffered cast. Returns (bestScore, bestMatch, candidates).
+-- score 4 = strong match, 2 = loose match, 0 = no match. `candidates` counts the casts that scored 2+.
 local function ScoreCrit(unit, now)
   local unitGUID = SafeCall(UnitGUID, unit)
-  local bestScore, bestMatch = 0, nil
+  local bestScore, bestMatch, candidates = 0, nil, 0
 
   for _, cast in ipairs(castBuffer) do
     -- Target check: if we know which unit the cast was aimed at, the crit must land on it.
@@ -242,39 +270,51 @@ local function ScoreCrit(unit, now)
       targetMatches = false
     end
 
-    if targetMatches then
-      local age = now - cast.startTime
+    -- A cast that was never confirmed and is long past its expected completion was most likely
+    -- cancelled without us hearing about it. Don't let it soak up someone else's crit.
+    local stale = (not cast.confirmed) and (not cast.isChannel) and (not cast.isEmpower)
+      and (now - cast.startTime > cast.castTime + UNCONFIRMED_GRACE)
+
+    if targetMatches and not stale then
       local score = 0
 
       if cast.isChannel then
         -- Channels/empowers can tick at any point between start and end.
+        local age = now - cast.startTime
         if age >= -0.2 and age <= cast.castTime + CHANNEL_LATE_WINDOW then
           score = 4
         elseif age >= -0.5 and age <= cast.castTime + 1.0 then
           score = 2
         end
-      elseif cast.castTime == 0 then
-        -- Instant casts land almost immediately.
-        if age >= -0.2 and age <= INSTANT_WINDOW then
-          score = 4
-        elseif age >= 0 and age <= INSTANT_LOOSE then
-          score = 2
-        end
       else
-        -- Cast-time spells land near start + castTime + projectile travel.
-        local expected = cast.castTime
-        local lateWindow = math.max(CAST_LATE_WINDOW, expected * 0.25)
-        if age >= expected - CAST_EARLY_SLACK and age <= expected + lateWindow then
-          score = 4
-        elseif age >= expected and age <= expected + 1.0 then
-          score = 2
-        end
-        -- If the cast hasn't completed yet, it can't have produced a hit (non-channel).
-        if not cast.confirmed and age < cast.castTime then
-          score = 0
+        -- Measure from the moment the cast actually completed (SUCCEEDED) so pushback, haste and
+        -- latency can't skew the timing. Before that, estimate it from the spell's cast time.
+        local completedAt = cast.succeededAt or (cast.startTime + cast.castTime)
+        local age = now - completedAt
+
+        if not cast.confirmed and age < 0 then
+          score = 0 -- still casting: it can't have produced a hit yet
+        elseif cast.castTime == 0 then
+          -- Instant casts land almost immediately (slower projectiles score as a loose match).
+          if age >= -0.2 and age <= INSTANT_WINDOW then
+            score = 4
+          elseif age >= 0 and age <= INSTANT_LOOSE then
+            score = 2
+          end
+        else
+          -- Cast-time spells land shortly after completion, plus projectile travel.
+          local lateWindow = math.max(CAST_LATE_WINDOW, cast.castTime * 0.25)
+          if age >= -CAST_EARLY_SLACK and age <= lateWindow then
+            score = 4
+          elseif age >= 0 and age <= 1.0 then
+            score = 2
+          end
         end
       end
 
+      if score >= LOOSE_CONFIDENCE then
+        candidates = candidates + 1
+      end
       if score > bestScore then
         bestScore = score
         bestMatch = cast
@@ -282,7 +322,7 @@ local function ScoreCrit(unit, now)
     end
   end
 
-  return bestScore, bestMatch
+  return bestScore, bestMatch, candidates
 end
 
 local function DumpCastBuffer()
@@ -357,6 +397,15 @@ end
 -- only when it lines up with a specific cast on a specific target at a time consistent with that
 -- spell's cast time.
 
+-- White (auto-attack) hits are physical (school mask 1). If the school is hidden we can't tell, so
+-- we don't rule the crit out.
+local function IsPhysical(schoolMask)
+  if type(schoolMask) ~= 'number' or IsSecret(schoolMask) then
+    return true
+  end
+  return schoolMask == 1
+end
+
 local function IsAutoAttacking()
   local isCurrentSpell = (C_Spell and C_Spell.IsCurrentSpell) or IsCurrentSpell
   return isCurrentSpell ~= nil and SafeCall(isCurrentSpell, 6603) == true -- 6603 = Attack
@@ -380,10 +429,20 @@ local function SpellKey(kind, spellID)
   return kind .. ':' .. spellID, name or ('Spell ' .. spellID)
 end
 
--- UNIT_SPELLCAST_SENT(unit, target, castGUID, spellID) fires when the player begins casting.
--- The "target" arg is the token the cast is aimed at, which we save so the crit must land on it.
-local function OnSpellcastSent(_, target, castGUID, spellID)
-  local targetGUID = target and SafeCall(UnitGUID, target) or nil
+-- UNIT_SPELLCAST_SENT(unit, target, castGUID, spellID) fires when the player starts a cast, even one
+-- that later fails (out of range, no line of sight). The "target" arg is what the cast is aimed at;
+-- the wiki marks it conditionally secret, so it is only used when it is a plain string.
+local function OnSpellcastSent(unit, target, castGUID, spellID)
+  if not IsPlayerUnit(unit) then
+    return
+  end
+  castGUID, spellID = CleanGUID(castGUID), CleanNumber(spellID)
+
+  local targetGUID
+  if type(target) == 'string' and not IsSecret(target) and target ~= '' then
+    targetGUID = SafeCall(UnitGUID, target)
+  end
+
   PushCast({
     spellID = spellID,
     castGUID = castGUID,
@@ -395,17 +454,22 @@ local function OnSpellcastSent(_, target, castGUID, spellID)
     confirmed = false,
   })
   if debugMode then
-    printHowudoin('SENT', spellID, castGUID, 'target=' .. tostring(targetGUID))
+    printHowudoin('SENT', DebugValue(spellID), DebugValue(castGUID), 'target=' .. tostring(targetGUID))
   end
 end
 
-local function OnSpellcastSucceeded(_, castGUID, spellID)
+local function OnSpellcastSucceeded(unit, castGUID, spellID)
+  if not IsPlayerUnit(unit) then
+    return
+  end
+  castGUID, spellID = CleanGUID(castGUID), CleanNumber(spellID)
+
   local existing = FindCastByGUID(castGUID)
   if existing then
     existing.confirmed = true
     existing.succeededAt = GetTime()
     if debugMode then
-      printHowudoin('SUCCEEDED', spellID, castGUID, '(confirmed)')
+      printHowudoin('SUCCEEDED', DebugValue(spellID), DebugValue(castGUID), '(confirmed)')
     end
     return
   end
@@ -424,11 +488,16 @@ local function OnSpellcastSucceeded(_, castGUID, spellID)
     succeededAt = now,
   })
   if debugMode then
-    printHowudoin('SUCCEEDED', spellID, castGUID, '(fallback, no SENT)')
+    printHowudoin('SUCCEEDED', DebugValue(spellID), DebugValue(castGUID), '(fallback, no SENT)')
   end
 end
 
-local function OnChannelStart(_, castGUID, spellID)
+local function OnChannelStart(unit, castGUID, spellID)
+  if not IsPlayerUnit(unit) then
+    return
+  end
+  castGUID, spellID = CleanGUID(castGUID), CleanNumber(spellID)
+
   local existing = FindCastByGUID(castGUID)
   if existing then
     existing.isChannel = true
@@ -445,11 +514,16 @@ local function OnChannelStart(_, castGUID, spellID)
     })
   end
   if debugMode then
-    printHowudoin('CHANNEL_START', spellID, castGUID)
+    printHowudoin('CHANNEL_START', DebugValue(spellID), DebugValue(castGUID))
   end
 end
 
-local function OnEmpowerStart(_, castGUID, spellID)
+local function OnEmpowerStart(unit, castGUID, spellID)
+  if not IsPlayerUnit(unit) then
+    return
+  end
+  castGUID, spellID = CleanGUID(castGUID), CleanNumber(spellID)
+
   local existing = FindCastByGUID(castGUID)
   if existing then
     existing.isEmpower = true
@@ -466,7 +540,23 @@ local function OnEmpowerStart(_, castGUID, spellID)
     })
   end
   if debugMode then
-    printHowudoin('EMPOWER_START', spellID, castGUID)
+    printHowudoin('EMPOWER_START', DebugValue(spellID), DebugValue(castGUID))
+  end
+end
+
+-- UNIT_SPELLCAST_FAILED / FAILED_QUIET / INTERRUPTED: a cast that never completed can't produce a hit,
+-- so drop it. Casts the game already confirmed (SUCCEEDED) are kept: their projectile may still be
+-- in flight. (UNIT_SPELLCAST_STOP is deliberately not used: it also fires after a normal cast.)
+local function OnSpellcastCancelled(unit, castGUID)
+  if not IsPlayerUnit(unit) then
+    return
+  end
+  local cast = FindCastByGUID(CleanGUID(castGUID))
+  if cast and not cast.confirmed and not cast.isChannel and not cast.isEmpower then
+    RemoveCast(cast)
+    if debugMode then
+      printHowudoin('cancelled cast removed', DebugValue(cast.spellID), DebugValue(cast.castGUID))
+    end
   end
 end
 
@@ -502,11 +592,15 @@ local function OnUnitCombat(unit, action, flagText, amount, schoolMask)
   end
 
   local now = GetTime()
-  local score, matchedCast = ScoreCrit(unit, now)
+  local score, matchedCast, candidates = ScoreCrit(unit, now)
   local key, name
 
-  if score >= HIGH_CONFIDENCE and matchedCast then
-    -- High-confidence match: this crit lines up with a specific cast.
+  -- A strong match wins outright. A loose match is accepted when it is the only cast that could
+  -- have produced the hit, which covers slow projectiles without guessing between several casts.
+  local attributed = matchedCast and (score >= HIGH_CONFIDENCE or (score >= LOOSE_CONFIDENCE and candidates == 1))
+
+  if attributed then
+    -- This crit lines up with a specific cast.
     key, name = SpellKey(isHeal and 'heal' or 'dmg', matchedCast.spellID)
     local lastCrit = lastCritByCastGUID[matchedCast.castGUID] or 0
     if now - lastCrit < DUPLICATE_WINDOW then
@@ -520,9 +614,9 @@ local function OnUnitCombat(unit, action, flagText, amount, schoolMask)
       printHowudoin('attributed to cast', matchedCast.spellID, 'score=' .. score)
     end
 
-  elseif (not isHeal) and IsAutoAttacking() and howudoinCharSettings.TRIGGER_ON_SWING then
-    -- No cast match at all: could be an auto-attack. Gate by group state because in groups another
-    -- melee player could be the source.
+  elseif (not isHeal) and IsPhysical(schoolMask) and IsAutoAttacking() and howudoinCharSettings.TRIGGER_ON_SWING then
+    -- No cast match: could be an auto-attack (physical damage only, so pet and DoT crits don't count).
+    -- Gate by group state because in groups another melee player could be the source.
     local inGroup = SafeCall(IsInGroup) == true or SafeCall(IsInRaid) == true
     if inGroup and howudoinCharSettings.SWING_SOLO_ONLY then
       if debugMode then
@@ -722,14 +816,12 @@ local frame = CreateFrame('Frame')
 -- Some clients don't know every event; swallow registration errors so one unknown event can't
 -- take down the rest of the addon.
 local function TryRegisterEvent(event)
-  if pcall(frame.RegisterEvent, frame, event) == false then
-    -- Intentionally silent; a missing event just means that handler never fires.
-  end
+  pcall(frame.RegisterEvent, frame, event)
 end
 
+-- The cast handlers also check that the unit is the player, so the plain-event fallback is safe.
 local function TryRegisterUnitEvent(event, unit)
-  if pcall(frame.RegisterUnitEvent, frame, event, unit) == false then
-    -- Some events aren't unit events on every client. Fall back to RegisterEvent.
+  if not pcall(frame.RegisterUnitEvent, frame, event, unit) then
     pcall(frame.RegisterEvent, frame, event)
   end
 end
@@ -755,6 +847,9 @@ handlers.ADDON_LOADED = function(name)
     TryRegisterUnitEvent('UNIT_SPELLCAST_SUCCEEDED', 'player')
     TryRegisterUnitEvent('UNIT_SPELLCAST_CHANNEL_START', 'player')
     TryRegisterUnitEvent('UNIT_SPELLCAST_EMPOWER_START', 'player')
+    TryRegisterUnitEvent('UNIT_SPELLCAST_FAILED', 'player')
+    TryRegisterUnitEvent('UNIT_SPELLCAST_FAILED_QUIET', 'player')
+    TryRegisterUnitEvent('UNIT_SPELLCAST_INTERRUPTED', 'player')
     TryRegisterEvent('PLAYER_REGEN_ENABLED')
   end
 end
@@ -764,6 +859,9 @@ handlers.UNIT_SPELLCAST_SENT = OnSpellcastSent
 handlers.UNIT_SPELLCAST_SUCCEEDED = OnSpellcastSucceeded
 handlers.UNIT_SPELLCAST_CHANNEL_START = OnChannelStart
 handlers.UNIT_SPELLCAST_EMPOWER_START = OnEmpowerStart
+handlers.UNIT_SPELLCAST_FAILED = OnSpellcastCancelled
+handlers.UNIT_SPELLCAST_FAILED_QUIET = OnSpellcastCancelled
+handlers.UNIT_SPELLCAST_INTERRUPTED = OnSpellcastCancelled
 handlers.PLAYER_REGEN_ENABLED = function()
   ClearTable(castBuffer)
   ClearTable(lastCritByCastGUID)
@@ -776,8 +874,3 @@ frame:SetScript('OnEvent', function(_, event, ...)
     handler(...)
   end
 end)
-
--- Loaded confirmation (visible in chat when the file compiles cleanly)
-if debugMode then
-  printHowudoin('main.lua loaded')
-end

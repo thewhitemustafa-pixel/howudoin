@@ -108,7 +108,8 @@ Because of that, expect some differences from Classic Era:
 - Damage-over-time ticks, pets and totems aren't supported.
 - The finisher sound plays when your crit **kills** the target. For heals, it plays when the target ends up at full health, which the game often hides during combat, so heal finishers will rarely trigger.
 - If the game hides combat values (for example in some dungeons and raids), crits can't be detected there and you'll hear nothing. If only the damage number is hidden, you'll still hear the sound, but the best-crit filter can't judge it.
-- Very slow projectiles, or casts delayed by pushback, can land outside the matching window and stay silent.
+- Only physical hits count as auto-attacks, so a pet's or damage-over-time crit can't trigger the white-crit sound.
+- Projectiles with more than about a second of travel time can land outside the matching window and stay silent. If a single cast could have caused the hit, a slightly late one is still accepted.
 
 Forever support is based on the beta and may need tuning as the game changes.
 
@@ -140,7 +141,7 @@ Settings from earlier versions are kept when you update. New options are added w
 | `NUM_SOUNDS` | 14 | How many `howudoinN.ogg` files exist |
 | `FINISHER_CHECK_DELAY` | 0.1 | Forever only: wait before checking whether the crit killed the target |
 | `DUPLICATE_WINDOW` | 0.1 | Forever only: ignores repeat events for the same hit |
-| `INSTANT_WINDOW`, `INSTANT_LOOSE`, `CAST_EARLY_SLACK`, `CAST_LATE_WINDOW`, `CHANNEL_LATE_WINDOW`, `HIGH_CONFIDENCE` | see `main.lua` | Forever only: how closely a crit must line up with one of your casts |
+| `INSTANT_WINDOW`, `INSTANT_LOOSE`, `CAST_EARLY_SLACK`, `CAST_LATE_WINDOW`, `CHANNEL_LATE_WINDOW`, `HIGH_CONFIDENCE`, `LOOSE_CONFIDENCE`, `UNCONFIRMED_GRACE` | see `main.lua` | Forever only: how closely a crit must line up with one of your casts |
 
 ## Troubleshooting
 
@@ -159,7 +160,8 @@ Settings from earlier versions are kept when you update. New options are added w
 - Added WoW: Forever beta support (no combat log required).
 - New: best-crit filter, tolerance setting, crit records, and the `best`, `tolerance`, `records` and `reset` commands.
 - New: settings window (Options > AddOns > howudoin, or `/howudoin`) and an addon list icon.
-- New: cast-matching for WoW: Forever, so crits are credited to a specific cast; `/howudoin swingsolo` and `/howudoin buffer`.
+- New: cast-matching for WoW: Forever, so crits are credited to a specific cast. It ignores failed and interrupted casts, times hits from the moment a cast actually completes (so pushback doesn't matter), and only counts physical hits as auto-attacks.
+- New: `/howudoin swingsolo` and `/howudoin buffer`.
 - New: `/howudoin debug`.
 - Fixed: heal finisher never triggered on overhealing crits.
 - Fixed: throttle now has sub-second accuracy, and normal and finisher sounds share one cooldown.
