@@ -1,4 +1,5 @@
 local ADDON_ID = 'howudoin'
+local _, ns = ... -- addon namespace, shared with Options.lua
 local FINISHER = 'Interface/AddOns/howudoin/finisher/finisher.ogg'
 local SOUND_PATH = 'Interface/AddOns/howudoin/sounds/howudoin%d.ogg'
 local NUM_SOUNDS = 14
@@ -580,16 +581,26 @@ end
 
 local MAX_RECORDS_SHOWN = 10
 
-local function ShowRecords()
+-- Returns your records as a list, highest first. Also used by the settings window.
+local function GetSortedRecords()
   local list = {}
   for _, record in pairs(howudoinCharSettings.BEST_CRITS) do
     list[#list + 1] = record
   end
+  table.sort(list, function(a, b) return a.amount > b.amount end)
+  return list
+end
+
+local function ResetRecords()
+  howudoinCharSettings.BEST_CRITS = {}
+end
+
+local function ShowRecords()
+  local list = GetSortedRecords()
   if #list == 0 then
     printHowudoin('-- No crit records yet. Go land some crits!')
     return
   end
-  table.sort(list, function(a, b) return a.amount > b.amount end)
   printHowudoin('-- Your best crits')
   for i = 1, math.min(#list, MAX_RECORDS_SHOWN) do
     print(format('  %s: %.0f', list[i].name or '?', list[i].amount))
@@ -632,6 +643,33 @@ local TOGGLES = {
   },
 }
 
+local function ShowHelp()
+  PlayRandomHowudoin()
+  printHowudoin('Config')
+  print('  Plays a random howudoin when you land a crit!')
+  print('  Mode: ' .. (HAS_COMBAT_LOG and 'combat log' or 'unit events (no combat log available)') .. '|n')
+  local settings = howudoinCharSettings
+  print('/howudoin|n-- Open the settings window.')
+  print('/howudoin swing|n-- Toggle - Sound triggers on Weapon(White) crits.', 'Currently', formatSetting(settings.TRIGGER_ON_SWING))
+  print('/howudoin swingsolo|n-- Toggle - Only credit auto-attack crits to you while solo.', 'Currently', formatSetting(settings.SWING_SOLO_ONLY))
+  print('/howudoin overkill|n-- Toggle - Different howudoin sound for finishing crits (overkill / killing blow).', 'Currently', formatSetting(settings.FINISHER_ON_OVERKILL))
+  print('/howudoin throttle|n-- Toggle - Sets a ' .. THROTTLE_SECONDS .. ' second cooldown on sounds playing (Helps reduce spam for melee classes and for AOE).', 'Currently', formatSetting(settings.THROTTLE_SOUNDS))
+  print('/howudoin best|n-- Toggle - Only play for crits close to your best crit with that spell.', 'Currently', formatSetting(settings.BEST_CRIT_ONLY))
+  print('/howudoin tolerance <0-100>|n-- How close to your best counts, in percent (0 = new records only).', 'Currently', settings.BEST_TOLERANCE .. '%')
+  print('/howudoin records|n-- Show your best crits.')
+  print('/howudoin reset|n-- Clear your crit records.')
+  print('/howudoin buffer|n-- Dump the current cast buffer (for troubleshooting).')
+  print('/howudoin debug|n-- Toggle - Print what the addon sees, for troubleshooting.', 'Currently', formatSetting(debugMode))
+  print('/howudoin help|n-- Show this list.')
+end
+
+-- Keep the settings window in step when something changes from a slash command.
+local function NotifySettingsChanged()
+  if ns.RefreshOptions then
+    ns.RefreshOptions()
+  end
+end
+
 SLASH_HOWUDOIN1 = '/howudoin'
 SlashCmdList['HOWUDOIN'] = function(input)
   local command, arg = strtrim(input or ''):lower():match('^(%S*)%s*(.-)$')
@@ -646,30 +684,35 @@ SlashCmdList['HOWUDOIN'] = function(input)
   elseif command == 'records' then
     ShowRecords()
   elseif command == 'reset' then
-    settings.BEST_CRITS = {}
+    ResetRecords()
     printHowudoin('-- Crit records cleared.')
   elseif command == 'debug' then
     debugMode = not debugMode
     printHowudoin('-- Debug output (best-crit decisions' .. (HAS_COMBAT_LOG and '' or ', UNIT_COMBAT events, cast buffer') .. ').', formatSetting(debugMode))
   elseif command == 'buffer' then
     DumpCastBuffer()
+  elseif command == '' or command == 'config' or command == 'options' or command == 'settings' then
+    -- Open the settings window; fall back to the text help if this client can't show it.
+    if not (ns.OpenOptions and ns.OpenOptions()) then
+      ShowHelp()
+    end
   else
-    PlayRandomHowudoin()
-    printHowudoin('Config')
-    print('  Plays a random howudoin when you land a crit!')
-    print('  Mode: ' .. (HAS_COMBAT_LOG and 'combat log' or 'unit events (no combat log available)') .. '|n')
-    print('/howudoin swing|n-- Toggle - Sound triggers on Weapon(White) crits.', 'Currently', formatSetting(settings.TRIGGER_ON_SWING))
-    print('/howudoin swingsolo|n-- Toggle - Only credit auto-attack crits to you while solo.', 'Currently', formatSetting(settings.SWING_SOLO_ONLY))
-    print('/howudoin overkill|n-- Toggle - Different howudoin sound for finishing crits (overkill / killing blow).', 'Currently', formatSetting(settings.FINISHER_ON_OVERKILL))
-    print('/howudoin throttle|n-- Toggle - Sets a ' .. THROTTLE_SECONDS .. ' second cooldown on sounds playing (Helps reduce spam for melee classes and for AOE).', 'Currently', formatSetting(settings.THROTTLE_SOUNDS))
-    print('/howudoin best|n-- Toggle - Only play for crits close to your best crit with that spell.', 'Currently', formatSetting(settings.BEST_CRIT_ONLY))
-    print('/howudoin tolerance <0-100>|n-- How close to your best counts, in percent (0 = new records only).', 'Currently', settings.BEST_TOLERANCE .. '%')
-    print('/howudoin records|n-- Show your best crits.')
-    print('/howudoin reset|n-- Clear your crit records.')
-    print('/howudoin buffer|n-- Dump the current cast buffer (for troubleshooting).')
-    print('/howudoin debug|n-- Toggle - Print what the addon sees, for troubleshooting.', 'Currently', formatSetting(debugMode))
+    ShowHelp()
   end
+
+  NotifySettingsChanged()
 end
+
+-- Shared with Options.lua
+ns.ADDON_TITLE = ADDON_TITLE
+ns.ADDON_VERSION = ADDON_VERSION
+ns.HAS_COMBAT_LOG = HAS_COMBAT_LOG
+ns.THROTTLE_SECONDS = THROTTLE_SECONDS
+ns.DEFAULTS = DEFAULTS
+ns.PlayRandomHowudoin = PlayRandomHowudoin
+ns.PlayFinisher = function() PlaySoundFile(FINISHER, 'Master') end
+ns.GetSortedRecords = GetSortedRecords
+ns.ResetRecords = ResetRecords
 
 -- Wiring
 
@@ -697,6 +740,9 @@ handlers.ADDON_LOADED = function(name)
   end
   frame:UnregisterEvent('ADDON_LOADED')
   InitSettings()
+  if ns.InitOptions then
+    ns.InitOptions()
+  end
 
   -- Only register the events the current client allows. Registering COMBAT_LOG_EVENT_UNFILTERED on
   -- Midnight-rules clients raises a forbidden-action error, so it must never be touched there.

@@ -2,9 +2,11 @@
 ## Title: howudoin
 ## Notes: Gives you a nice howudoin
 ## Author: Truetard
-## Version: 0.1.1
+## Version: 0.1.0
+## IconTexture: Interface\AddOns\howudoin\icon.png
 ## SavedVariablesPerCharacter: howudoinCharSettings
 ## DefaultState: Enabled
 ## LoadOnDemand: 0
 
 main.lua
+Options.lua
