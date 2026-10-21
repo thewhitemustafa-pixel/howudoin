@@ -89,7 +89,7 @@ How it works in detail:
 
 ## WoW: Forever notes
 
-WoW: Forever follows Midnight's addon rules: addons have no combat log, and some combat information is hidden from them. howudoin handles this by watching unit combat events, which report that a unit took a crit but not who caused it. A crit is credited to you when:
+WoW: Forever follows Midnight's addon rules: addons have no combat log, and some combat information is hidden from them. howudoin handles this by watching unit combat events, which report that a unit took a crit but not who caused it. A crit is credited (hopefully to you) when:
 
 - it lands on your **current target** (damage) or on a **friendly unit** (healing), and
 - it happens within about 1.5 seconds of one of your casts, or while you are auto-attacking.
@@ -145,6 +145,9 @@ Settings from earlier versions are kept when you update. New options are added w
 **The addon shows as out of date.** The `## Interface:` line in `howudoin.toc` needs your client's number. Run `/dump select(4, GetBuildInfo())` in game to see it.
 
 ## Changelog
+
+### 0.1.1
+- Fixed: Licensing
 
 ### 0.1.0
 
