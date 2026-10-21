@@ -9,7 +9,6 @@ local FINISHER_CHECK_DELAY = 0.1 -- seconds to wait before checking "did that cr
 local DUPLICATE_WINDOW = 0.1     -- UNIT_COMBAT can fire once per unit token for the same hit; ignore repeats
 
 -- Cast-buffer / attribution tuning
-local ATTRIBUTION_WINDOW   = 1.5  -- legacy fallback window (kept for compatibility); not used by the new path
 local MAX_CASTS            = 12   -- buffer size
 local CAST_BUFFER_MAX_AGE  = 15   -- seconds before a cast is pruned
 local DEDUP_MAX_AGE        = 30   -- seconds before a per-castGUID dedup entry is pruned
@@ -187,7 +186,6 @@ end
 local castBuffer = {}          -- newest-first array of cast records
 local lastCritByCastGUID = {}  -- [castGUID] = last crit time, for per-cast dedup
 local lastSwingCritTime = 0    -- global dedup for the swing fallback
-local inCombat = false
 local nextSyntheticCastID = 0
 
 local function PruneCastBuffer()
@@ -238,48 +236,49 @@ local function ScoreCrit(unit, now)
 
   for _, cast in ipairs(castBuffer) do
     -- Target check: if we know which unit the cast was aimed at, the crit must land on it.
+    local targetMatches = true
     if cast.targetGUID and unitGUID and cast.targetGUID ~= unitGUID then
-      goto continue
+      targetMatches = false
     end
 
-    local age = now - cast.startTime
-    local score = 0
+    if targetMatches then
+      local age = now - cast.startTime
+      local score = 0
 
-    if cast.isChannel then
-      -- Channels/empowers can tick at any point between start and end.
-      if age >= -0.2 and age <= cast.castTime + CHANNEL_LATE_WINDOW then
-        score = 4
-      elseif age >= -0.5 and age <= cast.castTime + 1.0 then
-        score = 2
+      if cast.isChannel then
+        -- Channels/empowers can tick at any point between start and end.
+        if age >= -0.2 and age <= cast.castTime + CHANNEL_LATE_WINDOW then
+          score = 4
+        elseif age >= -0.5 and age <= cast.castTime + 1.0 then
+          score = 2
+        end
+      elseif cast.castTime == 0 then
+        -- Instant casts land almost immediately.
+        if age >= -0.2 and age <= INSTANT_WINDOW then
+          score = 4
+        elseif age >= 0 and age <= INSTANT_LOOSE then
+          score = 2
+        end
+      else
+        -- Cast-time spells land near start + castTime + projectile travel.
+        local expected = cast.castTime
+        local lateWindow = math.max(CAST_LATE_WINDOW, expected * 0.25)
+        if age >= expected - CAST_EARLY_SLACK and age <= expected + lateWindow then
+          score = 4
+        elseif age >= expected and age <= expected + 1.0 then
+          score = 2
+        end
+        -- If the cast hasn't completed yet, it can't have produced a hit (non-channel).
+        if not cast.confirmed and age < cast.castTime then
+          score = 0
+        end
       end
-    elseif cast.castTime == 0 then
-      -- Instant casts land almost immediately.
-      if age >= -0.2 and age <= INSTANT_WINDOW then
-        score = 4
-      elseif age >= 0 and age <= INSTANT_LOOSE then
-        score = 2
-      end
-    else
-      -- Cast-time spells land near start + castTime + projectile travel.
-      local expected = cast.castTime
-      local lateWindow = math.max(CAST_LATE_WINDOW, expected * 0.25)
-      if age >= expected - CAST_EARLY_SLACK and age <= expected + lateWindow then
-        score = 4
-      elseif age >= expected and age <= expected + 1.0 then
-        score = 2
-      end
-      -- If the cast hasn't completed yet, it can't have produced a hit (non-channel).
-      if not cast.confirmed and age < cast.castTime then
-        score = 0
+
+      if score > bestScore then
+        bestScore = score
+        bestMatch = cast
       end
     end
-
-    if score > bestScore then
-      bestScore = score
-      bestMatch = cast
-    end
-
-    ::continue::
   end
 
   return bestScore, bestMatch
@@ -380,10 +379,10 @@ local function SpellKey(kind, spellID)
   return kind .. ':' .. spellID, name or ('Spell ' .. spellID)
 end
 
--- UNIT_SPELLCAST_SENT: fires when the player begins casting. Arg 1 is the unit the cast is aimed at
--- (a token like "target" or "focus"), which we save so the crit has to land on the intended unit.
-local function OnSpellcastSent(unitTarget, castGUID, spellID)
-  local targetGUID = unitTarget and SafeCall(UnitGUID, unitTarget) or nil
+-- UNIT_SPELLCAST_SENT(unit, target, castGUID, spellID) fires when the player begins casting.
+-- The "target" arg is the token the cast is aimed at, which we save so the crit must land on it.
+local function OnSpellcastSent(_, target, castGUID, spellID)
+  local targetGUID = target and SafeCall(UnitGUID, target) or nil
   PushCast({
     spellID = spellID,
     castGUID = castGUID,
@@ -677,6 +676,21 @@ end
 local handlers = {}
 local frame = CreateFrame('Frame')
 
+-- Some clients don't know every event; swallow registration errors so one unknown event can't
+-- take down the rest of the addon.
+local function TryRegisterEvent(event)
+  if pcall(frame.RegisterEvent, frame, event) == false then
+    -- Intentionally silent; a missing event just means that handler never fires.
+  end
+end
+
+local function TryRegisterUnitEvent(event, unit)
+  if pcall(frame.RegisterUnitEvent, frame, event, unit) == false then
+    -- Some events aren't unit events on every client. Fall back to RegisterEvent.
+    pcall(frame.RegisterEvent, frame, event)
+  end
+end
+
 handlers.ADDON_LOADED = function(name)
   if name ~= ADDON_ID then
     return
@@ -690,13 +704,12 @@ handlers.ADDON_LOADED = function(name)
     frame:RegisterEvent('COMBAT_LOG_EVENT_UNFILTERED')
   else
     -- Forever: build a small cast timeline and match crits against it.
-    frame:RegisterEvent('UNIT_COMBAT')
-    frame:RegisterEvent('UNIT_SPELLCAST_SENT')
-    frame:RegisterUnitEvent('UNIT_SPELLCAST_SUCCEEDED', 'player')
-    frame:RegisterUnitEvent('UNIT_SPELLCAST_CHANNEL_START', 'player')
-    frame:RegisterUnitEvent('UNIT_SPELLCAST_EMPOWER_START', 'player')
-    frame:RegisterEvent('PLAYER_REGEN_DISABLED')
-    frame:RegisterEvent('PLAYER_REGEN_ENABLED')
+    TryRegisterEvent('UNIT_COMBAT')
+    TryRegisterUnitEvent('UNIT_SPELLCAST_SENT', 'player')
+    TryRegisterUnitEvent('UNIT_SPELLCAST_SUCCEEDED', 'player')
+    TryRegisterUnitEvent('UNIT_SPELLCAST_CHANNEL_START', 'player')
+    TryRegisterUnitEvent('UNIT_SPELLCAST_EMPOWER_START', 'player')
+    TryRegisterEvent('PLAYER_REGEN_ENABLED')
   end
 end
 handlers.COMBAT_LOG_EVENT_UNFILTERED = OnCombatLog
@@ -705,11 +718,7 @@ handlers.UNIT_SPELLCAST_SENT = OnSpellcastSent
 handlers.UNIT_SPELLCAST_SUCCEEDED = OnSpellcastSucceeded
 handlers.UNIT_SPELLCAST_CHANNEL_START = OnChannelStart
 handlers.UNIT_SPELLCAST_EMPOWER_START = OnEmpowerStart
-handlers.PLAYER_REGEN_DISABLED = function()
-  inCombat = true
-end
 handlers.PLAYER_REGEN_ENABLED = function()
-  inCombat = false
   ClearTable(castBuffer)
   ClearTable(lastCritByCastGUID)
 end
@@ -721,3 +730,8 @@ frame:SetScript('OnEvent', function(_, event, ...)
     handler(...)
   end
 end)
+
+-- Loaded confirmation (visible in chat when the file compiles cleanly)
+if debugMode then
+  printHowudoin('main.lua loaded')
+end
