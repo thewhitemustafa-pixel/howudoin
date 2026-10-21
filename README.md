@@ -63,7 +63,7 @@ Type `/howudoin` to open the settings window. You can also find it under **Optio
 | `/howudoin overkill` | Toggle: play the finisher sound on crits that finish the target | On |
 | `/howudoin throttle` | Toggle: minimum 2 seconds between sounds | Off |
 | `/howudoin best` | Toggle: only play for crits close to your best with that spell | Off |
-| `/howudoin tolerance <0-100>` | How close to your best counts, in percent. `0` means new records only | 5 |
+| `/howudoin tolerance <0-100>` | How close to your best counts, in percent. `0` means record ties or better | 5 |
 | `/howudoin records` | Show your best crits (top 10, highest first) | |
 | `/howudoin reset` | Clear all crit records | |
 | `/howudoin help` | Print this list in chat (and play a sample sound) | |
@@ -89,7 +89,7 @@ How it works in detail:
 - **New ranks start fresh.** A higher spell rank is a different spell and builds its own record.
 - **Records are tracked even with the filter off.** If you switch it on later, you already have history to compare against.
 - **The filter applies to the finisher sound too.** A weak crit that happens to kill is skipped, like any other weak crit.
-- **Tolerance `0` is "records only."** The sound only plays when you beat or tie your best.
+- **Tolerance `0` means record-level crits.** The sound plays when you beat or tie your best.
 - **Damage rolls vary.** Spells and weapons hit for a range, so a tight tolerance is picky. If 5% feels too quiet, try 10 to 15.
 - **One lucky crit raises the bar.** A huge crit from a cooldown or proc becomes the record, and normal crits after it may be skipped until you run `/howudoin reset`.
 - **If the game hides a crit's damage number, the sound plays as normal.** The addon can't measure it, so it doesn't filter it or record it (see below).
@@ -110,6 +110,8 @@ Because of that, expect some differences from Classic Era:
 - If the game hides combat values (for example in some dungeons and raids), crits can't be detected there and you'll hear nothing. If only the damage number is hidden, you'll still hear the sound, but the best-crit filter can't judge it.
 - Only physical hits count as auto-attacks, so a pet's or damage-over-time crit can't trigger the white-crit sound.
 - Projectiles with more than about a second of travel time can land outside the matching window and stay silent. If a single cast could have caused the hit, a slightly late one is still accepted.
+- If two recent casts are equally plausible matches for a crit, the addon rejects the attribution rather than guessing which spell caused it.
+- Finisher checks verify that the affected unit token still refers to the same unit after the short delay. If its identity cannot be verified, the addon plays the regular crit sound rather than risking a false finisher.
 
 Forever support is based on the beta and may need tuning as the game changes.
 
@@ -153,20 +155,37 @@ Settings from earlier versions are kept when you update. New options are added w
 
 **The addon shows as out of date.** The `## Interface:` line in `howudoin.toc` needs your client's number. Run `/dump select(4, GetBuildInfo())` in game to see it.
 
-## Changelog
+# Changelog
 
-### 0.1.0
+## 0.2.0
+
+### Improved
+- WoW: Forever cast attribution now rejects a crit when multiple buffered casts share the same highest score. This avoids silently crediting the crit to whichever matching cast happens to be visited first.
+- Delayed finisher checks now capture the affected unit's GUID and verify that the unit token still refers to that same unit before checking death or health.
+
+### Clarified
+- A best-crit tolerance of `0%` means a crit must tie or beat the recorded best. Ties qualify; a strictly higher record is not required.
+- README and wiki guidance now describe the current commands and Forever attribution limitations more consistently.
+
+### Notes
+- Classic Era's combat-log detection path is unchanged.
+- WoW: Forever - Completely refactored crit attribution filtering into robust multi-layer approach
+- WoW: Forever - Added best effort deduplication
+- WoW: Forever - Combat cast events now log in a buffer matched to casts and target
+- WoW: Forever - Added confidence scoring evaluation to reduce false attributions
+- WoW: Forever remains best-effort: its unit-combat events do not reliably identify the source of a crit. The new checks reduce avoidable false attribution but cannot make the underlying event source-aware.
+- If a finisher check cannot verify the affected unit's identity, the regular crit sound plays instead of the finisher sound.
+
+## 0.1.5
+- Added the settings window, addon-list icon, Forever cast matching, swing-solo option, cast-buffer diagnostics, and debug output.
+- Fixed healing-finisher handling and sound throttle timing.
+- Begun refactor of combat attribution filters
+
+## 0.1.0
 
 - Added WoW: Forever beta support (no combat log required).
-- New: best-crit filter, tolerance setting, crit records, and the `best`, `tolerance`, `records` and `reset` commands.
-- New: settings window (Options > AddOns > howudoin, or `/howudoin`) and an addon list icon.
-- New: cast-matching for WoW: Forever, so crits are credited to a specific cast. It ignores failed and interrupted casts, times hits from the moment a cast actually completes (so pushback doesn't matter), and only counts physical hits as auto-attacks.
-- New: `/howudoin swingsolo` and `/howudoin buffer`.
-- New: `/howudoin debug`.
-- Fixed: heal finisher never triggered on overhealing crits.
-- Fixed: throttle now has sub-second accuracy, and normal and finisher sounds share one cooldown.
-- Fixed: errors when the `.toc` is missing a title or version.
-- Changed: `/howudoin` with no arguments now opens the settings window. `/howudoin help` prints the command list.
+- Added the best-crit filter, tolerance setting, crit records, and related commands.
+
 
 ## Credits
 

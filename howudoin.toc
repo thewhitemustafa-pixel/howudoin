@@ -2,7 +2,7 @@
 ## Title: howudoin
 ## Notes: Gives you a nice howudoin
 ## Author: Truetard
-## Version: 0.1.0
+## Version: 0.2.0
 ## IconTexture: Interface\AddOns\howudoin\icon.png
 ## SavedVariablesPerCharacter: howudoinCharSettings
 ## DefaultState: Enabled

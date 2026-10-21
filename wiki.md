@@ -12,9 +12,9 @@ After installing the addon and restarting the game, type:
 
 `/howudoin`
 
-This displays the current configuration and plays a sample sound.
+This opens the settings window. Use its sound-test controls to confirm that audio files load. If the settings window cannot open on your client, the addon falls back to text help and plays a sample sound.
 
-**If you hear the sample, your sound files are loading.** That doesn't guarantee that crit detection is working; the sample plays independently of combat detection.
+**A successful sound test confirms that audio playback works.** It does not guarantee that crit detection is working; sound testing is independent of combat detection.
 
 By default:
 
@@ -32,15 +32,18 @@ All commands begin with `/howudoin`. Commands that toggle a setting switch it be
 
 | Command | What it does | Default |
 | --- | --- | --- |
-| `/howudoin` | Show settings and play a sample sound | — |
+| `/howudoin` | Open the settings window (or fall back to text help and a sample sound) | — |
 | `/howudoin swing` | Toggle sounds for weapon (white) crits | On |
+| `/howudoin swingsolo` | On Forever, only attribute auto-attack crits while solo | On |
 | `/howudoin overkill` | Toggle the special finisher sound | On |
 | `/howudoin throttle` | Toggle the two-second sound cooldown | Off |
 | `/howudoin best` | Toggle the best-crit filter | Off |
 | `/howudoin tolerance 10` | Set the best-crit tolerance to 10% | 5% |
 | `/howudoin records` | Show your ten highest recorded crits | — |
+| `/howudoin buffer` | Show the recent casts tracked by Forever attribution | — |
 | `/howudoin reset` | Clear all crit records | — |
 | `/howudoin debug` | Toggle diagnostic output | Off |
+| `/howudoin help` | Print command help in chat and play a sample sound | — |
 
 ### Weapon crits: `swing`
 
@@ -98,7 +101,7 @@ The minimum qualifying value is calculated as:
 
 `Recorded best × (1 − tolerance / 100)`
 
-A tolerance of 0 means **records only**: a crit must equal or exceed your previous best.
+A tolerance of 0 means **record-level crits only**: a crit must equal or exceed your previous best. Ties qualify; the crit does not have to set a strictly higher record.
 
 ### Records are tracked separately
 
@@ -147,11 +150,13 @@ Land a few crits and inspect the output for errors or unexpected behavior. Inclu
 
 The addon uses unit-combat events because it cannot rely on the Classic combat-log path.
 
-It can only evaluate events whose relevant information is available to the addon. If the game hides the event type or other required values, the addon cannot identify the crit.
+It can only evaluate events whose relevant information is available to the addon. If the game hides the event type or other required values, the addon cannot identify the crit. The addon correlates these events with a short buffer of your recent casts, using timing and target information where available.
 
 Try testing outside a dungeon or raid, where combat information may be more accessible. Enable debug output with `/howudoin debug` and inspect the events the addon reports.
 
 If the addon works in the open world but not in an instance, this may be an API restriction rather than a broken installation.
+
+The addon rejects a crit when multiple buffered casts share the same highest attribution score. This can mean a missed sound during overlapping casts, but avoids arbitrarily crediting the crit to one of them. A delayed finisher check also verifies that the affected unit token still identifies the same unit; if that cannot be confirmed, it uses the regular crit sound instead.
 
 ### Sounds trigger for another player's crit
 
@@ -159,7 +164,7 @@ This is a known limitation of the WoW: Forever detection method.
 
 The unit-combat event does not identify who caused the critical hit. The addon infers that a crit belongs to you based on your recent casts, your current target, or your auto-attack state.
 
-In a group, another player's crit on your target can therefore trigger your sound. There is no reliable user setting that eliminates this ambiguity.
+In a group, another player's spell crit on your target can therefore still be mistaken for yours when it coincides with a recent cast. For auto-attacks, `/howudoin swingsolo` suppresses swing attribution while grouped by default; turning it off accepts a greater risk of false sounds. There is no setting that completely eliminates spell-attribution ambiguity.
 
 ### Area-of-effect spells do not behave as expected
 
@@ -212,6 +217,20 @@ WoW: Forever uses a best-effort detection method based on unit-combat events. Be
 Expect possible misattribution in groups, incomplete area-of-effect coverage, limitations around pets and damage-over-time effects, and missing detections when combat values are hidden.
 
 These limitations come from the available game API, not from the sound settings.
+
+## Changelog
+
+### 0.2.0
+
+- Rejects equally strong competing cast matches on WoW: Forever instead of choosing one arbitrarily.
+- Verifies the target's GUID before classifying a delayed finisher; if the unit identity is unavailable or changed, plays the regular crit sound.
+- Clarifies that 0% best-crit tolerance includes ties with the current record.
+- Updates command documentation for `swingsolo`, `buffer`, and `help`.
+
+### 0.1.0
+
+- Added WoW: Forever beta support and best-effort cast attribution.
+- Added the best-crit filter, crit records, settings window, and troubleshooting commands.
 
 ## Need More Information?
 

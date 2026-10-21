@@ -261,7 +261,7 @@ end
 -- score 4 = strong match, 2 = loose match, 0 = no match. `candidates` counts the casts that scored 2+.
 local function ScoreCrit(unit, now)
   local unitGUID = SafeCall(UnitGUID, unit)
-  local bestScore, bestMatch, candidates = 0, nil, 0
+  local bestScore, bestMatch, candidates, bestTies = 0, nil, 0, 0
 
   for _, cast in ipairs(castBuffer) do
     -- Target check: if we know which unit the cast was aimed at, the crit must land on it.
@@ -318,11 +318,15 @@ local function ScoreCrit(unit, now)
       if score > bestScore then
         bestScore = score
         bestMatch = cast
+        bestTies = score >= LOOSE_CONFIDENCE and 1 or 0
+      elseif score >= LOOSE_CONFIDENCE and score == bestScore then
+        -- Equal top scores are ambiguous. Do not silently prefer the newest buffered cast.
+        bestTies = bestTies + 1
       end
     end
   end
 
-  return bestScore, bestMatch, candidates
+  return bestScore, bestMatch, candidates, bestTies
 end
 
 local function DumpCastBuffer()
@@ -592,12 +596,14 @@ local function OnUnitCombat(unit, action, flagText, amount, schoolMask)
   end
 
   local now = GetTime()
-  local score, matchedCast, candidates = ScoreCrit(unit, now)
+  local targetGUID = SafeCall(UnitGUID, unit)
+  local score, matchedCast, candidates, bestTies = ScoreCrit(unit, now)
   local key, name
 
-  -- A strong match wins outright. A loose match is accepted when it is the only cast that could
-  -- have produced the hit, which covers slow projectiles without guessing between several casts.
-  local attributed = matchedCast and (score >= HIGH_CONFIDENCE or (score >= LOOSE_CONFIDENCE and candidates == 1))
+  -- A strong match wins only when it is the unique top-scoring cast. A loose match is accepted
+  -- when it is the only plausible cast. If the best score is tied, don't guess between casts.
+  local attributed = matchedCast and bestTies == 1
+    and (score >= HIGH_CONFIDENCE or (score >= LOOSE_CONFIDENCE and candidates == 1))
 
   if attributed then
     -- This crit lines up with a specific cast.
@@ -646,8 +652,17 @@ local function OnUnitCombat(unit, action, flagText, amount, schoolMask)
   end
 
   if howudoinCharSettings.FINISHER_ON_OVERKILL then
-    -- Give the game a moment to register the death / health change before we look.
+    -- Give the game a moment to register the death / health change before we look. Unit tokens
+    -- such as "target" can change during that delay, so verify the token still refers to this unit.
     C_Timer.After(FINISHER_CHECK_DELAY, function()
+      local currentGUID = SafeCall(UnitGUID, unit)
+      if not targetGUID or currentGUID ~= targetGUID then
+        if debugMode then
+          printHowudoin('finisher check skipped: unit changed or GUID unavailable')
+        end
+        PlayCritSound(false)
+        return
+      end
       PlayCritSound(TargetFinished(unit, isHeal))
     end)
   else
@@ -749,7 +764,7 @@ local function ShowHelp()
   print('/howudoin overkill|n-- Toggle - Different howudoin sound for finishing crits (overkill / killing blow).', 'Currently', formatSetting(settings.FINISHER_ON_OVERKILL))
   print('/howudoin throttle|n-- Toggle - Sets a ' .. THROTTLE_SECONDS .. ' second cooldown on sounds playing (Helps reduce spam for melee classes and for AOE).', 'Currently', formatSetting(settings.THROTTLE_SOUNDS))
   print('/howudoin best|n-- Toggle - Only play for crits close to your best crit with that spell.', 'Currently', formatSetting(settings.BEST_CRIT_ONLY))
-  print('/howudoin tolerance <0-100>|n-- How close to your best counts, in percent (0 = new records only).', 'Currently', settings.BEST_TOLERANCE .. '%')
+  print('/howudoin tolerance <0-100>|n-- How close to your best counts, in percent (0 = record ties or better).', 'Currently', settings.BEST_TOLERANCE .. '%')
   print('/howudoin records|n-- Show your best crits.')
   print('/howudoin reset|n-- Clear your crit records.')
   print('/howudoin buffer|n-- Dump the current cast buffer (for troubleshooting).')
